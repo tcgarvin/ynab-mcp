@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ynab-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-15",
+  // Required by the OAuth library when accepting Client ID Metadata Documents: stops a
+  // client-supplied metadata URL from reaching anything inside Cloudflare.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  // The custom domain is the only entry point: OAuth issuer and resource URLs are fixed to it.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "ynab-mcp.tcgarvin.com", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  // Invocation logs record full URLs, which on /callback include the OAuth code and state.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } }
+}
