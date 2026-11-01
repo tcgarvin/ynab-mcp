@@ -32,20 +32,20 @@ function layout(title: string, body: string): string {
 
 export function landingPage(): Response {
   const body = `<h1>MCP Server for YNAB</h1>
-<p>A private, single-user server that lets the owner's AI assistant read their YNAB data and
-categorize their transactions. Connect an MCP client to <code>/mcp</code>.</p>`;
+<p>A private, single-user server that lets the owner's AI assistant read their YNAB data, and
+categorize and annotate their transactions. Connect an MCP client to <code>/mcp</code>.</p>`;
   return new Response(layout('MCP Server for YNAB', body), { headers: HTML_HEADERS });
 }
 
 export function privacyPage(): Response {
   const body = `<h1>Privacy policy</h1>
-<p><em>Last updated: October 31, 2026</em></p>
+<p><em>Last updated: November 1, 2026</em></p>
 <p>MCP Server for YNAB is a private server for its owner's personal use. Only YNAB accounts on the
 owner's allowlist can sign in.</p>
 <h2>What it does with your data</h2>
 <p>When an AI assistant you connected makes a request, the server fetches the relevant YNAB data
-and returns it to that assistant, or changes the category and approval status of the transactions
-it names. Your YNAB authorization grants full access to your plan, but the server only offers those
+and returns it to that assistant, or changes the category, memo, flag, and approval status of the
+transactions it names. Your YNAB authorization grants full access to your plan, but the server only offers those
 actions. Your data is used only for this purpose, and is not sold, or shared with anyone else. Your
 assistant's provider handles what it receives under its own terms.</p>
 <h2>What is stored</h2>
@@ -75,8 +75,8 @@ export function consentPage(details: ConsentDescription, handle: string): string
 <p>${origin} Access will be sent to <strong>${escapeHtml(details.redirectHost)}</strong>.</p>
 ${loopbackWarning}
 <p>It will be able to <strong>read</strong> your plans, accounts, categories, payees, and
-transactions, and <strong>change the category and approval status</strong> of existing
-transactions. This server offers no way to create or delete anything, or to change amounts.</p>
+transactions, and <strong>change the category, memo, flag, and approval status</strong> of
+existing transactions. This server offers no way to create or delete anything, or to change amounts.</p>
 <p>The authorization you give YNAB on the next screen is for full access, because YNAB has no
 narrower option that allows changes.</p>
 <form method="post">

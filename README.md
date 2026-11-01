@@ -1,6 +1,7 @@
 # MCP Server for YNAB
 
-A private remote MCP server that lets an AI assistant read YNAB data and categorize transactions.
+A private remote MCP server that lets an AI assistant read YNAB data, and categorize and annotate
+transactions.
 It runs on the Cloudflare Workers Free plan at `https://ynab-mcp.tcgarvin.com/mcp`.
 
 ## Tools
@@ -11,9 +12,11 @@ It runs on the Cloudflare Workers Free plan at `https://ynab-mcp.tcgarvin.com/mc
 | `list_accounts`               | Accounts and balances                                        |
 | `get_month`                   | Ready to Assign, and each category's amounts and id          |
 | `list_payees`                 | Payees and their ids                                         |
+| `get_payee_history`           | Most used categories for up to 10 payees                     |
 | `list_transactions`           | Search transactions by date, account, category, payee, type  |
 | `list_scheduled_transactions` | Upcoming and recurring transactions                          |
 | `categorize_transactions`     | Set the category and approval status of existing transactions |
+| `annotate_transactions`       | Set the memo and flag color of existing transactions         |
 
 ## How it works
 
@@ -23,14 +26,20 @@ It runs on the Cloudflare Workers Free plan at `https://ynab-mcp.tcgarvin.com/mc
 - **Setup errors:** if a required secret isn't set, sign-in and MCP requests return a 503 naming the
   missing settings, without their values.
 - **Writes:** YNAB's only write-capable OAuth access is full access, so the limit on what can change
-  comes from this server offering just one write tool.
+  comes from this server offering just two write tools. Neither can change amounts, dates, payees, or
+  budget assignments, or create or delete anything.
 - **State:** every MCP request is stateless, so there are no sessions or Durable Objects.
 
 ## Cost
 
 The Free plan costs $0, and going over a limit makes requests fail rather than generating a bill.
 Limits are 100,000 requests per day, 10 ms of CPU per request, and 1,000 KV writes per day. To stay
-within the CPU limit, transaction searches default to 30 days and return at most 500 results.
+within the CPU limit, transaction searches return at most 500 results and cover at most 30 days,
+unless they have a payee, category, or type filter, which YNAB applies before the server parses
+anything. Any tool call fails if YNAB returns more than about 1 MB. The server is stateless, so it
+can't pace YNAB's 200 requests per hour; the instructions it gives agents explain that limit, the
+others here, and that "today" means the UTC date. Payee history is fetched per payee for the same reason. YNAB has no way to filter
+payees by name, so name search isn't offered: it would parse every payee on each call.
 
 ## Setup
 

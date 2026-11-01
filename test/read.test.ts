@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { defaultSinceDate } from '../src/mcp/server';
+import { assertParseableRange, defaultSinceDate } from '../src/mcp/server';
 import { YnabApiError, YnabClient } from '../src/ynab/client';
-import { fromMilliunits, listTransactions, transactionsPath, getMonth } from '../src/ynab/read';
+import {
+  fromMilliunits,
+  getMonth,
+  getPayeeHistory,
+  listTransactions,
+  transactionsPath,
+} from '../src/ynab/read';
 
 function stubYnab(body: unknown, status = 200) {
   const stub = vi.fn(async (_url: URL) => Response.json(body, { status }));
@@ -35,6 +41,56 @@ describe('fromMilliunits', () => {
 describe('defaultSinceDate', () => {
   it('goes back 30 days', () => {
     expect(defaultSinceDate(new Date('2026-10-31T12:00:00Z'))).toBe('2026-10-01');
+  });
+});
+
+describe('assertParseableRange', () => {
+  const now = new Date('2026-11-01T12:00:00Z');
+
+  it('allows a full calendar month', () => {
+    expect(() =>
+      assertParseableRange(
+        { sinceDate: '2026-10-01', untilDate: '2026-10-31', narrowed: false },
+        now,
+      ),
+    ).not.toThrow();
+  });
+
+  it('refuses 31 days and suggests how to narrow it', () => {
+    expect(() =>
+      assertParseableRange(
+        { sinceDate: '2026-10-01', untilDate: '2026-11-01', narrowed: false },
+        now,
+      ),
+    ).toThrow('payee_id, category_id, or type');
+  });
+
+  it('measures to today when there is no end date', () => {
+    expect(() =>
+      assertParseableRange({ sinceDate: '2026-05-01', narrowed: false }, now),
+    ).toThrow('184 days');
+  });
+
+  it('gives an open-ended range one extra day, as the caller can be a day behind UTC', () => {
+    expect(() =>
+      assertParseableRange({ sinceDate: '2026-10-01', narrowed: false }, now),
+    ).not.toThrow();
+    expect(() =>
+      assertParseableRange({ sinceDate: '2026-09-30', narrowed: false }, now),
+    ).toThrow('32 days');
+  });
+
+  it('allows the default range at any time of day', () => {
+    const lateInTheDay = new Date('2026-11-01T23:59:59Z');
+    expect(() =>
+      assertParseableRange({ sinceDate: defaultSinceDate(lateInTheDay), narrowed: false }, lateInTheDay),
+    ).not.toThrow();
+  });
+
+  it('allows any range YNAB will narrow first', () => {
+    expect(() =>
+      assertParseableRange({ sinceDate: '2016-05-01', narrowed: true }, now),
+    ).not.toThrow();
   });
 });
 
@@ -107,6 +163,178 @@ describe('listTransactions', () => {
   });
 });
 
+describe('listTransactions field selection', () => {
+  it('returns only the requested fields', async () => {
+    stubYnab({ data: { transactions: [transaction({ id: 't', payee_name: 'Kroger' })] } });
+
+    const result = await listTransactions(new YnabClient('token'), {
+      ...query,
+      fields: ['date', 'payee'],
+    });
+
+    expect(JSON.parse(JSON.stringify(result.transactions))).toEqual([
+      { date: '2026-10-01', payee: 'Kroger' },
+    ]);
+  });
+
+  it('leaves empty memo, flag, and splits out of the output by default', async () => {
+    stubYnab({ data: { transactions: [transaction({ memo: null, flag_color: '' })] } });
+
+    const result = await listTransactions(new YnabClient('token'), query);
+
+    expect(Object.keys(JSON.parse(JSON.stringify(result.transactions[0])))).toEqual([
+      'id',
+      'date',
+      'amount',
+      'payee',
+      'category',
+      'account',
+      'cleared',
+      'approved',
+    ]);
+  });
+
+  it('includes memo and flag when set', async () => {
+    stubYnab({ data: { transactions: [transaction({ memo: 'note', flag_color: 'red' })] } });
+
+    const result = await listTransactions(new YnabClient('token'), query);
+
+    expect(result.transactions[0]).toMatchObject({ memo: 'note', flag: 'red' });
+  });
+
+  it('returns payee_id only when asked for', async () => {
+    stubYnab({ data: { transactions: [transaction({ payee_id: 'p1' })] } });
+
+    const byDefault = await listTransactions(new YnabClient('token'), query);
+    const requested = await listTransactions(new YnabClient('token'), {
+      ...query,
+      fields: ['payee_id'],
+    });
+
+    expect(byDefault.transactions[0]).not.toHaveProperty('payee_id');
+    expect(requested.transactions[0]).toEqual({ payee_id: 'p1' });
+  });
+
+  it('returns only the count and total for a limit of zero', async () => {
+    stubYnab({ data: { transactions: [transaction({ amount: -1500 })] } });
+
+    const result = await listTransactions(new YnabClient('token'), { ...query, limit: 0 });
+
+    expect(result.transactions).toEqual([]);
+    expect(result.matching_count).toBe(1);
+    expect(result.total_amount).toBe(-1.5);
+  });
+});
+
+describe('getPayeeHistory', () => {
+  const food = { category_id: 'food', category_name: 'Food' };
+  const gas = { category_id: 'gas', category_name: 'Gas' };
+  const kroger = { payee_name: 'Kroger' };
+  const historyQuery = { planId: 'last-used', sinceDate: '2026-05-01', payeeIds: ['kroger'] };
+
+  async function history(transactions: unknown[]) {
+    stubYnab({ data: { transactions } });
+    const result = await getPayeeHistory(new YnabClient('token'), historyQuery);
+    return result.payees[0];
+  }
+
+  it('ranks categories by use', async () => {
+    const result = await history([
+      transaction({ ...kroger, ...gas, date: '2026-10-05' }),
+      transaction({ ...kroger, ...food, date: '2026-10-01' }),
+      transaction({ ...kroger, ...food, date: '2026-10-02' }),
+    ]);
+
+    expect(result).toEqual({
+      payee_id: 'kroger',
+      payee: 'Kroger',
+      transaction_count: 3,
+      last_date: '2026-10-05',
+      categories: [
+        { category_id: 'food', category: 'Food', count: 2 },
+        { category_id: 'gas', category: 'Gas', count: 1 },
+      ],
+    });
+  });
+
+  it('breaks ties in favor of the most recently used category', async () => {
+    const result = await history([
+      transaction({ ...kroger, ...food, date: '2026-10-01' }),
+      transaction({ ...kroger, ...gas, date: '2026-10-02' }),
+    ]);
+
+    expect(result?.categories.map((c) => c.category)).toEqual(['Gas', 'Food']);
+  });
+
+  it('keeps only the top three categories but counts every transaction', async () => {
+    const categories = ['a', 'b', 'c', 'd'].map((id) => ({ category_id: id, category_name: id }));
+    const result = await history(categories.map((c) => transaction({ ...kroger, ...c })));
+
+    expect(result?.categories).toHaveLength(3);
+    expect(result?.transaction_count).toBe(4);
+  });
+
+  it('ignores deleted, unapproved, uncategorized, split parent, and transfer rows', async () => {
+    const result = await history([
+      transaction({ ...kroger, ...food, deleted: true }),
+      transaction({ ...kroger, ...food, approved: false }),
+      transaction({ ...kroger, category_id: null, category_name: null }),
+      transaction({ ...kroger, category_id: 'internal', category_name: 'Uncategorized' }),
+      transaction({ ...kroger, category_id: 'internal-2', category_name: 'Split' }),
+      transaction({ ...kroger, ...food, transfer_account_id: 'savings' }),
+    ]);
+
+    expect(result).toEqual({
+      payee_id: 'kroger',
+      payee: 'Kroger',
+      transaction_count: 0,
+      last_date: null,
+      categories: [],
+    });
+  });
+
+  it('counts the separate rows YNAB returns for split parts', async () => {
+    const result = await history([
+      transaction({ ...kroger, ...food, type: 'subtransaction', parent_transaction_id: 'p' }),
+      transaction({ ...kroger, ...gas, type: 'subtransaction', parent_transaction_id: 'p' }),
+    ]);
+
+    expect(result?.transaction_count).toBe(2);
+  });
+
+  it('reports a payee with no transactions rather than leaving it out', async () => {
+    const result = await history([]);
+
+    expect(result).toMatchObject({ payee_id: 'kroger', payee: null, transaction_count: 0 });
+  });
+
+  it('asks YNAB for each payee separately, never the whole plan', async () => {
+    const stub = stubYnab({ data: { transactions: [] } });
+
+    await getPayeeHistory(new YnabClient('token'), {
+      ...historyQuery,
+      payeeIds: ['kroger', 'shell'],
+      untilDate: '2026-10-15',
+    });
+
+    const urls = stub.mock.calls.map((call) => call[0]);
+    expect(urls.map((url) => url.pathname)).toEqual([
+      '/v1/plans/last-used/payees/kroger/transactions',
+      '/v1/plans/last-used/payees/shell/transactions',
+    ]);
+    expect(urls[0]?.searchParams.get('since_date')).toBe('2026-05-01');
+    expect(urls[0]?.searchParams.get('until_date')).toBe('2026-10-15');
+  });
+
+  it('fails the call when YNAB rejects any payee', async () => {
+    stubYnab({ error: { id: '404', name: 'not_found', detail: 'Payee not found' } }, 404);
+
+    await expect(getPayeeHistory(new YnabClient('token'), historyQuery)).rejects.toThrow(
+      'Payee not found',
+    );
+  });
+});
+
 describe('getMonth', () => {
   it('hides hidden, deleted, and internal categories', async () => {
     const category = {
@@ -153,6 +381,38 @@ describe('getMonth', () => {
         goal_underfunded: 0,
       },
     ]);
+  });
+});
+
+describe('YnabClient response limit', () => {
+  const emptyList = { transactions: [] };
+
+  it('accepts a response under the limit', async () => {
+    stubYnab({ data: emptyList, padding: 'x'.repeat(600_000) });
+
+    const result = await listTransactions(new YnabClient('token'), query);
+
+    expect(result.matching_count).toBe(0);
+  });
+
+  it('refuses a response over the limit', async () => {
+    stubYnab({ data: emptyList, padding: 'x'.repeat(1_000_001) });
+
+    await expect(listTransactions(new YnabClient('token'), query)).rejects.toThrow(
+      'more data than this server processes',
+    );
+  });
+
+  it('counts every response in a call that makes several requests', async () => {
+    stubYnab({ data: emptyList, padding: 'x'.repeat(600_000) });
+
+    await expect(
+      getPayeeHistory(new YnabClient('token'), {
+        planId: 'last-used',
+        sinceDate: '2026-05-01',
+        payeeIds: ['kroger', 'shell'],
+      }),
+    ).rejects.toThrow('more data than this server processes');
   });
 });
 
