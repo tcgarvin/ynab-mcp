@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { YnabClient } from '../src/ynab/client';
-import { categorizeTransactions, type CategorizationRequest } from '../src/ynab/write';
+import {
+  annotateTransactions,
+  categorizeTransactions,
+  type AnnotationRequest,
+  type CategorizationRequest,
+} from '../src/ynab/write';
 
 function stubSave(data: unknown, status = 200) {
   const bodies: unknown[] = [];
@@ -98,5 +103,94 @@ describe('categorizeTransactions', () => {
     await expect(
       categorizeTransactions(new YnabClient('token'), 'plan', [request]),
     ).rejects.toThrow('Bad category');
+  });
+});
+
+describe('annotateTransactions', () => {
+  const annotation: AnnotationRequest = {
+    transactionId: 't1',
+    approved: false,
+    memo: 'needs Tim',
+    flagColor: 'red',
+  };
+  const savedAnnotation = { id: 't1', approved: false, memo: 'needs Tim', flag_color: 'red' };
+
+  it('sends the memo, flag, and approval status, but never a category', async () => {
+    const { bodies, methods } = stubSave({ data: { transactions: [savedAnnotation] } });
+
+    await annotateTransactions(new YnabClient('token'), 'plan', [annotation]);
+
+    expect(methods).toEqual(['PATCH']);
+    expect(bodies).toEqual([
+      { transactions: [{ id: 't1', approved: false, memo: 'needs Tim', flag_color: 'red' }] },
+    ]);
+  });
+
+  it('leaves out a memo or flag that was not provided, so YNAB keeps it', async () => {
+    const { bodies } = stubSave({ data: { transactions: [savedAnnotation] } });
+
+    await annotateTransactions(new YnabClient('token'), 'plan', [
+      { transactionId: 't1', approved: false, flagColor: 'red' },
+    ]);
+
+    expect(bodies[0]).toEqual({ transactions: [{ id: 't1', approved: false, flag_color: 'red' }] });
+  });
+
+  it('sends null to clear a memo and flag', async () => {
+    const { bodies } = stubSave({
+      data: { transactions: [{ id: 't1', approved: true, memo: null, flag_color: null }] },
+    });
+
+    const result = await annotateTransactions(new YnabClient('token'), 'plan', [
+      { transactionId: 't1', approved: true, memo: null, flagColor: null },
+    ]);
+
+    expect(bodies[0]).toEqual({
+      transactions: [{ id: 't1', approved: true, memo: null, flag_color: null }],
+    });
+    expect(result.updated_count).toBe(1);
+  });
+
+  it('treats an empty flag from YNAB as cleared', async () => {
+    stubSave({ data: { transactions: [{ id: 't1', approved: true, flag_color: '' }] } });
+
+    const result = await annotateTransactions(new YnabClient('token'), 'plan', [
+      { transactionId: 't1', approved: true, flagColor: null },
+    ]);
+
+    expect(result.results[0]).toEqual({
+      id: 't1',
+      status: 'updated',
+      memo: null,
+      flag_color: null,
+      approved: true,
+    });
+  });
+
+  it('does not report a difference in surrounding whitespace as a failure', async () => {
+    stubSave({ data: { transactions: [savedAnnotation] } });
+
+    const result = await annotateTransactions(new YnabClient('token'), 'plan', [
+      { ...annotation, memo: '  needs Tim ' },
+    ]);
+
+    expect(result.updated_count).toBe(1);
+  });
+
+  it('reports not_applied when YNAB saved something else', async () => {
+    stubSave({ data: { transactions: [{ ...savedAnnotation, flag_color: 'blue' }] } });
+
+    const result = await annotateTransactions(new YnabClient('token'), 'plan', [annotation]);
+
+    expect(result.not_applied_count).toBe(1);
+    expect(result.results[0]).toMatchObject({ status: 'not_applied', flag_color: 'blue' });
+  });
+
+  it('reports not_applied when YNAB leaves a transaction out of its response', async () => {
+    stubSave({ data: { transactions: [] } });
+
+    const result = await annotateTransactions(new YnabClient('token'), 'plan', [annotation]);
+
+    expect(result.results[0]).toMatchObject({ id: 't1', status: 'not_applied' });
   });
 });

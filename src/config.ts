@@ -3,7 +3,7 @@ import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 export const PUBLIC_ORIGIN = 'https://ynab-mcp.tcgarvin.com';
 export const MCP_PATH = '/mcp';
 export const CALLBACK_PATH = '/callback';
-/** Covers every tool: reading YNAB data and categorizing existing transactions. */
+/** Covers every tool: reading YNAB data, and categorizing and annotating existing transactions. */
 export const SCOPE_ACCESS = 'ynab:access';
 
 export interface Env {

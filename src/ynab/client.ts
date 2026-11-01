@@ -2,6 +2,12 @@ import { z } from 'zod';
 
 const API_BASE = 'https://api.ynab.com/v1';
 
+/** YNAB's limit per rolling hour. This server is stateless, so it can only report it, not pace it. */
+export const YNAB_REQUESTS_PER_HOUR = 200;
+// Bounds the CPU any one tool call can spend parsing, including calls that make several requests.
+// Roughly 1,300 transactions, and enough for the full payee list of a plan with about 8,000 payees.
+const MAX_RESPONSE_CHARS_PER_CLIENT = 1_000_000;
+
 const errorBodySchema = z.object({ error: z.object({ detail: z.string() }) });
 
 export class YnabApiError extends Error {
@@ -18,6 +24,8 @@ export type QueryParams = Record<string, string | undefined>;
 
 /** Thin client for the YNAB API. One instance serves one MCP request. */
 export class YnabClient {
+  private responseChars = 0;
+
   constructor(private readonly accessToken: string) {}
 
   get<Schema extends z.ZodType>(
@@ -60,7 +68,18 @@ export class YnabClient {
     });
     if (!response.ok) throw await toApiError(response);
 
-    const parsed = schema.safeParse(await response.json());
+    // Checked on the text because parsing is the expensive step this limit exists to avoid.
+    const text = await response.text();
+    this.responseChars += text.length;
+    if (this.responseChars > MAX_RESPONSE_CHARS_PER_CLIENT) {
+      throw new YnabApiError(
+        response.status,
+        'YNAB returned more data than this server processes in one call. Use a shorter date ' +
+          'range or fewer payees.',
+      );
+    }
+
+    const parsed = schema.safeParse(JSON.parse(text));
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       const location = issue === undefined ? 'unknown field' : issue.path.join('.');
@@ -81,7 +100,8 @@ async function toApiError(response: Response): Promise<YnabApiError> {
   if (status === 429) {
     return new YnabApiError(
       status,
-      'YNAB rate limit reached (200 requests per rolling hour). Try again later.',
+      `YNAB rate limit reached (${YNAB_REQUESTS_PER_HOUR} requests per rolling hour). Retrying ` +
+        'now will not help, so stop and try again later.',
     );
   }
   const body = errorBodySchema.safeParse(await response.json().catch(() => null));

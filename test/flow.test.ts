@@ -252,7 +252,7 @@ describe('sign-in', () => {
 });
 
 describe('MCP endpoint', () => {
-  it('marks only categorize_transactions as writing', async () => {
+  it('marks only the categorize and annotate tools as writing', async () => {
     stubYnab();
     const { tokens } = await signIn();
     const response = await mcp(tokens.access_token, 'tools/list');
@@ -260,8 +260,10 @@ describe('MCP endpoint', () => {
       result: { tools: { name: string; annotations: { readOnlyHint: boolean } }[] };
     };
     expect(body.result.tools.map((tool) => tool.name).sort()).toEqual([
+      'annotate_transactions',
       'categorize_transactions',
       'get_month',
+      'get_payee_history',
       'list_accounts',
       'list_payees',
       'list_plans',
@@ -269,7 +271,10 @@ describe('MCP endpoint', () => {
       'list_transactions',
     ]);
     const writing = body.result.tools.filter((tool) => !tool.annotations.readOnlyHint);
-    expect(writing.map((tool) => tool.name)).toEqual(['categorize_transactions']);
+    expect(writing.map((tool) => tool.name).sort()).toEqual([
+      'annotate_transactions',
+      'categorize_transactions',
+    ]);
   });
 
   it('answers initialize', async () => {
@@ -282,6 +287,20 @@ describe('MCP endpoint', () => {
     });
     const body = (await response.json()) as { result: { serverInfo: { name: string } } };
     expect(body.result.serverInfo.name).toBe('ynab-mcp');
+  });
+
+  it('tells agents about the request, date range, data, and UTC limits', async () => {
+    stubYnab();
+    const { tokens } = await signIn();
+    const response = await mcp(tokens.access_token, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '1' },
+    });
+    const body = (await response.json()) as { result: { instructions: string } };
+    for (const limit of ['200 requests per rolling hour', 'at most 30 days', '1 MB', 'UTC']) {
+      expect(body.result.instructions).toContain(limit);
+    }
   });
 
   it('calls YNAB with the stored token', async () => {
@@ -347,6 +366,48 @@ describe('MCP endpoint', () => {
     const response = await mcp(tokens.access_token, 'tools/call', {
       name: 'categorize_transactions',
       arguments: { categorizations: [item, item] },
+    });
+    const body = (await response.json()) as { result: { isError: boolean } };
+    expect(body.result.isError).toBe(true);
+    expect(apiTokens.length).toBe(callsBefore);
+  });
+
+  it('refuses a long transaction range without calling YNAB', async () => {
+    const { apiTokens } = stubYnab();
+    const { tokens } = await signIn();
+    const callsBefore = apiTokens.length;
+    const response = await mcp(tokens.access_token, 'tools/call', {
+      name: 'list_transactions',
+      arguments: { since_date: '2020-01-01', account_id: 'checking' },
+    });
+    const body = (await response.json()) as {
+      result: { isError: boolean; content: { text: string }[] };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0]?.text).toContain('narrow it');
+    expect(apiTokens.length).toBe(callsBefore);
+  });
+
+  it('refuses more than ten payees in one history call', async () => {
+    const { apiTokens } = stubYnab();
+    const { tokens } = await signIn();
+    const callsBefore = apiTokens.length;
+    const response = await mcp(tokens.access_token, 'tools/call', {
+      name: 'get_payee_history',
+      arguments: { payee_ids: Array.from({ length: 11 }, (_, index) => `p${index}`) },
+    });
+    const body = (await response.json()) as { result: { isError: boolean } };
+    expect(body.result.isError).toBe(true);
+    expect(apiTokens.length).toBe(callsBefore);
+  });
+
+  it('refuses an annotation that changes nothing', async () => {
+    const { apiTokens } = stubYnab();
+    const { tokens } = await signIn();
+    const callsBefore = apiTokens.length;
+    const response = await mcp(tokens.access_token, 'tools/call', {
+      name: 'annotate_transactions',
+      arguments: { annotations: [{ transaction_id: 't1', approved: true }] },
     });
     const body = (await response.json()) as { result: { isError: boolean } };
     expect(body.result.isError).toBe(true);
