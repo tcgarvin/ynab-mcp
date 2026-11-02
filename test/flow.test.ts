@@ -1,8 +1,44 @@
-import { SELF } from 'cloudflare:test';
+import { env, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Env } from '../src/config';
 
+const { OAUTH_KV: kv } = env as unknown as Env;
 const ORIGIN = 'https://ynab-mcp.tcgarvin.com';
-const CLIENT_REDIRECT = 'https://client.example/callback';
+const CLIENT_ID = 'https://claude.ai/oauth/claude-code-client-metadata';
+const CLIENT_REDIRECT = 'http://localhost:3118/callback';
+const CHATGPT_CLIENT_ID = 'https://chatgpt.com/oauth/client.json';
+const CHATGPT_REDIRECT = 'https://chatgpt.com/connector_platform_oauth_redirect';
+const CODEX_CLIENT_ID = 'https://chatgpt.com/oauth/codex/client.json';
+
+// Copied from what OpenAI serves at these URLs, since their shape decides how the OAuth library
+// negotiates client authentication.
+const OPENAI_METADATA_DOCUMENTS: Record<string, unknown> = {
+  [CHATGPT_CLIENT_ID]: {
+    client_id: CHATGPT_CLIENT_ID,
+    client_uri: 'https://chatgpt.com/',
+    redirect_uris: [CHATGPT_REDIRECT],
+    token_endpoint_auth_method: 'private_key_jwt',
+    token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    client_name: 'ChatGPT',
+    logo_uri: 'https://persistent.oaistatic.com/sonic/misc/openai-logo.png',
+    token_endpoint_auth_signing_alg: 'RS256',
+    jwks_uri: 'https://chatgpt.com/oauth/jwks.json',
+  },
+  [CODEX_CLIENT_ID]: {
+    client_id: CODEX_CLIENT_ID,
+    client_uri: 'https://chatgpt.com/codex',
+    application_type: 'native',
+    redirect_uris: ['http://127.0.0.1/callback', 'http://localhost/callback'],
+    token_endpoint_auth_method: 'none',
+    token_endpoint_auth_methods_supported: ['none'],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    client_name: 'Codex',
+    logo_uri: 'https://persistent.oaistatic.com/sonic/misc/openai-logo.png',
+  },
+};
 
 interface YnabStubOptions {
   userId?: string;
@@ -13,6 +49,7 @@ interface YnabStubOptions {
 function stubYnab(options: YnabStubOptions = {}) {
   const apiTokens: string[] = [];
   const tokenGrants: string[] = [];
+  const fetchedUrls: string[] = [];
   let issued = 0;
 
   vi.stubGlobal(
@@ -20,6 +57,24 @@ function stubYnab(options: YnabStubOptions = {}) {
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const url = new URL(request.url);
+      fetchedUrls.push(url.href);
+
+      if (url.href === CLIENT_ID) {
+        return Response.json({
+          client_id: CLIENT_ID,
+          client_name: 'Test <Client>',
+          client_uri: 'https://claude.ai',
+          redirect_uris: ['http://localhost/callback', 'http://127.0.0.1/callback'],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          token_endpoint_auth_method: 'none',
+        });
+      }
+
+      const openaiDocument = OPENAI_METADATA_DOCUMENTS[url.href];
+      if (openaiDocument !== undefined) {
+        return Response.json(openaiDocument);
+      }
 
       if (url.href === 'https://app.ynab.com/oauth/token') {
         const form = await request.formData();
@@ -58,7 +113,7 @@ function stubYnab(options: YnabStubOptions = {}) {
       return Response.json({ error: { id: '404', name: 'not_found', detail: 'nope' } }, { status: 404 });
     }),
   );
-  return { apiTokens, tokenGrants };
+  return { apiTokens, tokenGrants, fetchedUrls };
 }
 
 function cookieHeader(response: Response): string {
@@ -66,21 +121,6 @@ function cookieHeader(response: Response): string {
     .getSetCookie()
     .map((cookie) => cookie.split(';')[0])
     .join('; ');
-}
-
-async function registerClient(): Promise<string> {
-  const response = await SELF.fetch(`${ORIGIN}/register`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_name: 'Test <Client>',
-      redirect_uris: [CLIENT_REDIRECT],
-      token_endpoint_auth_method: 'none',
-    }),
-  });
-  expect(response.status).toBe(201);
-  const body = (await response.json()) as { client_id: string };
-  return body.client_id;
 }
 
 const CODE_VERIFIER = 'a'.repeat(64);
@@ -93,12 +133,16 @@ async function codeChallenge(): Promise<string> {
     .replaceAll('=', '');
 }
 
-async function openConsent(clientId: string) {
+async function openConsent(
+  clientId = CLIENT_ID,
+  redirectUri = CLIENT_REDIRECT,
+  scope = 'ynab:access',
+) {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: clientId,
-    redirect_uri: CLIENT_REDIRECT,
-    scope: 'ynab:access',
+    redirect_uri: redirectUri,
+    scope,
     state: 'client-state',
     code_challenge: await codeChallenge(),
     code_challenge_method: 'S256',
@@ -120,9 +164,8 @@ function submitConsent(decision: string, handle: string, cookie: string) {
 }
 
 /** Runs the browser part of sign-in, stopping at the redirect back from YNAB. */
-async function signInAtYnab() {
-  const clientId = await registerClient();
-  const consent = await openConsent(clientId);
+async function signInAtYnab(clientId = CLIENT_ID, redirectUri = CLIENT_REDIRECT) {
+  const consent = await openConsent(clientId, redirectUri);
   const toYnab = await submitConsent('approve', consent.handle, consent.cookie);
   expect(toYnab.status).toBe(302);
   const ynabUrl = new URL(toYnab.headers.get('Location') ?? '');
@@ -147,14 +190,14 @@ interface TokenResponse {
   expires_in: number;
 }
 
-async function signIn() {
-  const { clientId, callback } = await signInAtYnab();
+async function signIn(requestedClientId = CLIENT_ID, redirectUri = CLIENT_REDIRECT) {
+  const { clientId, callback } = await signInAtYnab(requestedClientId, redirectUri);
   const code = new URL(callback.headers.get('Location') ?? '').searchParams.get('code') ?? '';
   const response = await requestToken({
     grant_type: 'authorization_code',
     client_id: clientId,
     code,
-    redirect_uri: CLIENT_REDIRECT,
+    redirect_uri: redirectUri,
     code_verifier: CODE_VERIFIER,
   });
   expect(response.status).toBe(200);
@@ -176,6 +219,7 @@ function mcp(accessToken: string, method: string, params: unknown = {}) {
 
 beforeEach(() => {
   vi.unstubAllGlobals();
+  stubYnab();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -200,7 +244,7 @@ describe('discovery', () => {
 
 describe('sign-in', () => {
   it('escapes the client name on the consent page', async () => {
-    const { html } = await openConsent(await registerClient());
+    const { html } = await openConsent();
     expect(html).not.toContain('Test <Client>');
     expect(html).toContain('Test &#60;Client&#62;');
   });
@@ -216,7 +260,7 @@ describe('sign-in', () => {
 
   it('never contacts YNAB when the user denies', async () => {
     const { tokenGrants } = stubYnab();
-    const consent = await openConsent(await registerClient());
+    const consent = await openConsent();
     const response = await submitConsent('deny', consent.handle, consent.cookie);
     const location = new URL(response.headers.get('Location') ?? '');
     expect(location.origin + location.pathname).toBe(CLIENT_REDIRECT);
@@ -225,9 +269,35 @@ describe('sign-in', () => {
   });
 
   it('refuses a consent submission without the browser cookie', async () => {
-    const consent = await openConsent(await registerClient());
+    const consent = await openConsent();
     const response = await submitConsent('approve', consent.handle, '');
     expect(response.status).toBe(400);
+  });
+
+  it('refuses a consent cookie presented at the YNAB callback', async () => {
+    const consent = await openConsent();
+    const response = await SELF.fetch(`${ORIGIN}/callback?code=c&state=${consent.handle}`, {
+      headers: { Cookie: consent.cookie },
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it('keeps the consent page out of frames and caches', async () => {
+    const { response } = await openConsent();
+    expect(response.headers.get('X-Frame-Options')).toBe('DENY');
+    expect(response.headers.get('Content-Security-Policy')).toBe("frame-ancestors 'none'");
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it('clears the transaction cookie after approval and after the callback', async () => {
+    stubYnab();
+    const consent = await openConsent();
+    const toYnab = await submitConsent('approve', consent.handle, consent.cookie);
+    const consentName = consent.cookie.split('=')[0];
+    expect(toYnab.headers.getSetCookie()).toContainEqual(expect.stringMatching(`^${consentName}=;`));
+
+    const { callback } = await signInAtYnab();
+    expect(callback.headers.getSetCookie()).toContainEqual(expect.stringContaining('Max-Age=0'));
   });
 
   it('refuses YNAB accounts that are not on the allowlist, and shows their id', async () => {
@@ -248,6 +318,226 @@ describe('sign-in', () => {
     stubYnab();
     const { tokens } = await signIn();
     expect(tokens.expires_in).toBeLessThanOrEqual(6900);
+  });
+});
+
+describe('which clients can connect', () => {
+  const EVIL_REDIRECT = 'https://evil.example/callback';
+  const EVIL_CLIENT = 'https://evil.example/client-metadata';
+
+  it('offers no client registration', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [EVIL_REDIRECT], token_endpoint_auth_method: 'none' }),
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it('advertises what apps need to choose client metadata documents', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.client_id_metadata_document_supported).toBe(true);
+    expect(body.registration_endpoint).toBeUndefined();
+  });
+
+  it('advertises only the public client flow, so ChatGPT does not choose private_key_jwt', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.token_endpoint_auth_methods_supported).toEqual(['none']);
+    expect(body.token_endpoint_auth_signing_alg_values_supported).toBeUndefined();
+    expect(response.headers.get('Content-Type')).toContain('application/json');
+  });
+
+  it('meets what OpenAI requires for its stable URLs', async () => {
+    const authorizationServer = await SELF.fetch(`${ORIGIN}/.well-known/oauth-authorization-server`);
+    const body = (await authorizationServer.json()) as Record<string, unknown>;
+    expect(body.authorization_response_iss_parameter_supported).toBe(true);
+    expect(body.issuer).toBe(ORIGIN);
+
+    const resource = await SELF.fetch(`${ORIGIN}/.well-known/oauth-protected-resource/mcp`);
+    const { authorization_servers: servers } = (await resource.json()) as {
+      authorization_servers: string[];
+    };
+    expect(servers).toEqual([body.issuer]);
+  });
+
+  describe.each([
+    ['ChatGPT', CHATGPT_CLIENT_ID, CHATGPT_REDIRECT],
+    ['Codex', CODEX_CLIENT_ID, 'http://127.0.0.1:5555/callback'],
+  ])('%s', (name, clientId, redirectUri) => {
+    it('names itself on the consent page, for the scopes it requests', async () => {
+      const { response, html } = await openConsent(
+        clientId,
+        redirectUri,
+        'ynab:access offline_access',
+      );
+      expect(response.status).toBe(200);
+      expect(html).toContain(`Allow ${name} to access`);
+    });
+
+    it('receives the code with the issuer it checks', async () => {
+      const { callback } = await signInAtYnab(clientId, redirectUri);
+      const location = new URL(callback.headers.get('Location') ?? '');
+      expect(location.origin + location.pathname).toBe(redirectUri);
+      expect(location.searchParams.get('iss')).toBe(ORIGIN);
+      expect(location.searchParams.get('state')).toBe('client-state');
+      expect(location.searchParams.has('code')).toBe(true);
+    });
+
+    it('receives the issuer when the user denies', async () => {
+      const consent = await openConsent(clientId, redirectUri);
+      const response = await submitConsent('deny', consent.handle, consent.cookie);
+      const location = new URL(response.headers.get('Location') ?? '');
+      expect(location.searchParams.get('error')).toBe('access_denied');
+      expect(location.searchParams.get('iss')).toBe(ORIGIN);
+    });
+
+    it('must use PKCE, and receives the issuer when refused for not using it', async () => {
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        scope: 'ynab:access',
+        state: 'client-state',
+        resource: `${ORIGIN}/mcp`,
+      });
+      const response = await SELF.fetch(`${ORIGIN}/authorize?${params}`, { redirect: 'manual' });
+      expect(response.status).toBe(302);
+      const location = new URL(response.headers.get('Location') ?? '');
+      expect(location.searchParams.get('error')).toBe('invalid_request');
+      expect(location.searchParams.get('iss')).toBe(ORIGIN);
+    });
+
+    it('signs in as a public client, calls a tool, and refreshes', async () => {
+      const { apiTokens, fetchedUrls } = stubYnab();
+      const { tokens } = await signIn(clientId, redirectUri);
+      await mcp(tokens.access_token, 'tools/call', { name: 'list_plans', arguments: {} });
+      expect(apiTokens.at(-1)).toBe('Bearer ynab-access-1');
+
+      const refreshed = await requestToken({
+        grant_type: 'refresh_token',
+        client_id: clientId,
+        refresh_token: tokens.refresh_token,
+      });
+      expect(refreshed.status).toBe(200);
+      expect(fetchedUrls).not.toContain('https://chatgpt.com/oauth/jwks.json');
+    });
+
+    it('writes nothing for a visitor who is not on the allowlist', async () => {
+      stubYnab({ userId: 'stranger' });
+      const before = (await kv.list()).keys;
+      const { callback } = await signInAtYnab(clientId, redirectUri);
+      expect(callback.status).toBe(403);
+      expect((await kv.list()).keys).toEqual(before);
+    });
+
+    it('refuses a client assertion, even naming this client', async () => {
+      const { fetchedUrls } = stubYnab();
+      const response = await requestToken({
+        grant_type: 'authorization_code',
+        client_id: clientId,
+        code: 'c',
+        client_assertion: 'x.y.z',
+        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+      });
+      expect(response.status).toBe(401);
+      expect(fetchedUrls).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['a redirect to another site', CLIENT_ID, EVIL_REDIRECT],
+    ['a lookalike of the Claude callback', CLIENT_ID, 'https://claude.ai.evil.example/api/mcp/auth_callback'],
+    ['remote http', CLIENT_ID, 'http://evil.example/callback'],
+    ['a metadata document on another site', EVIL_CLIENT, CLIENT_REDIRECT],
+    ['a metadata document on a lookalike host', 'https://claude.ai.evil.example/client', CLIENT_REDIRECT],
+    ['a metadata document over http', 'http://claude.ai/client', CLIENT_REDIRECT],
+    ['a metadata URL with userinfo', 'https://claude.ai@evil.example/client', CLIENT_REDIRECT],
+    ['an unlisted metadata document on ChatGPT', 'https://chatgpt.com/oauth/abc/client.json', CHATGPT_REDIRECT],
+    ['a ChatGPT metadata URL with a query', `${CHATGPT_CLIENT_ID}?x=1`, CHATGPT_REDIRECT],
+    ['a metadata document on a ChatGPT lookalike', 'https://chatgpt.com.evil.example/oauth/client.json', CHATGPT_REDIRECT],
+    ['an unlisted ChatGPT callback', CHATGPT_CLIENT_ID, 'https://chatgpt.com/connector/oauth/abc'],
+    ['a lookalike of the ChatGPT callback', CHATGPT_CLIENT_ID, 'https://chatgpt.com.evil.example/connector_platform_oauth_redirect'],
+    ['another site as ChatGPT\'s callback', CHATGPT_CLIENT_ID, EVIL_REDIRECT],
+  ])('refuses %s without fetching or redirecting', async (_name, clientId, redirectUri) => {
+    const { fetchedUrls } = stubYnab();
+    const { response } = await openConsent(clientId, redirectUri);
+    expect(response.status).toBe(400);
+    expect(response.headers.has('Location')).toBe(false);
+    expect(fetchedUrls).toEqual([]);
+  });
+
+  it('still shows consent to a client registered before registration was removed', async () => {
+    await kv.put(
+      'client:legacy-client',
+      JSON.stringify({
+        clientId: 'legacy-client',
+        clientName: 'Claude',
+        redirectUris: ['https://claude.ai/api/mcp/auth_callback', EVIL_REDIRECT],
+        grantTypes: ['authorization_code', 'refresh_token'],
+        responseTypes: ['code'],
+        tokenEndpointAuthMethod: 'none',
+      }),
+    );
+    const allowed = await openConsent('legacy-client', 'https://claude.ai/api/mcp/auth_callback');
+    expect(allowed.response.status).toBe(200);
+    const refused = await openConsent('legacy-client', EVIL_REDIRECT);
+    expect(refused.response.status).toBe(400);
+  });
+
+  it('completes sign-in on a loopback port the metadata document does not name', async () => {
+    const { callback } = await signInAtYnab(CLIENT_ID, 'http://127.0.0.1:53111/callback');
+    const location = new URL(callback.headers.get('Location') ?? '');
+    expect(location.origin).toBe('http://127.0.0.1:53111');
+    expect(location.searchParams.has('code')).toBe(true);
+  });
+
+  it.each([
+    ['a client assertion', { client_assertion: 'x.y.z', client_assertion_type: 'jwt-bearer' }, {}],
+    ['only an assertion type', { client_assertion_type: 'jwt-bearer' }, {}],
+    ['a foreign metadata URL', { client_id: EVIL_CLIENT }, {}],
+    ['Basic authentication', {}, { Authorization: `Basic ${btoa(`${EVIL_CLIENT}:secret`)}` }],
+  ])('refuses %s at the token endpoint without fetching', async (_name, fields, headers) => {
+    const { fetchedUrls } = stubYnab();
+    const response = await SELF.fetch(`${ORIGIN}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code: 'c', ...fields }),
+    });
+    expect(response.status).toBe(401);
+    expect(((await response.json()) as { error: string }).error).toBe('invalid_client');
+    expect(fetchedUrls).toEqual([]);
+  });
+});
+
+describe('KV writes', () => {
+  async function kvKeys(): Promise<string[]> {
+    return (await kv.list()).keys.map((key) => key.name);
+  }
+
+  it('writes nothing for a visitor who is not on the allowlist, at any step', async () => {
+    stubYnab({ userId: 'stranger' });
+    const before = await kvKeys();
+
+    const consent = await openConsent();
+    expect(consent.response.status).toBe(200);
+    expect(await kvKeys()).toEqual(before);
+
+    const denied = await openConsent();
+    await submitConsent('deny', denied.handle, denied.cookie);
+    expect(await kvKeys()).toEqual(before);
+
+    const { callback } = await signInAtYnab();
+    expect(callback.status).toBe(403);
+    expect(await kvKeys()).toEqual(before);
+  });
+
+  it('writes the grant once an allowed user has signed in', async () => {
+    const before = await kvKeys();
+    await signInAtYnab();
+    const added = (await kvKeys()).filter((key) => !before.includes(key));
+    expect(added).toEqual([expect.stringMatching(/^grant:allowed-user:/)]);
   });
 });
 

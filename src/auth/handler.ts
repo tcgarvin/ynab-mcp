@@ -15,21 +15,16 @@ import {
 } from '../config';
 import { YnabClient } from '../ynab/client';
 import { buildAuthorizeUrl, exchangeCode, YnabTokenError } from '../ynab/oauth';
+import { assertAllowedAuthorizeRequest } from './client-policy';
 import { consentPage, errorPage, landingPage, privacyPage } from './pages';
 import type { GrantProps } from './props';
+import { base64Url, beginTransaction, finishTransaction } from './sign-in-transaction';
 
 interface UpstreamData {
   codeVerifier: string;
 }
 
 const ynabUserSchema = z.object({ data: z.object({ user: z.object({ id: z.string() }) }) });
-
-function base64Url(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes))
-    .replaceAll('+', '-')
-    .replaceAll('/', '_')
-    .replaceAll('=', '');
-}
 
 async function s256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
@@ -41,39 +36,61 @@ function redirect(location: string, headers: Headers): Response {
   return new Response(null, { status: 302, headers });
 }
 
-async function showConsent(request: Request, env: Env): Promise<Response> {
+async function showConsent(request: Request, env: Env, settings: Settings): Promise<Response> {
+  assertAllowedAuthorizeRequest(new URL(request.url));
   const oauth = env.OAUTH_PROVIDER;
   const authRequest = await oauth.parseAuthRequest(request);
-  // Described first, because a failed client lookup then leaves nothing behind in KV.
   const details = await oauth.describeConsent(authRequest);
-  const consent = await oauth.beginConsent(authRequest);
-  consent.headers.set('Content-Type', 'text/html; charset=utf-8');
-  return new Response(consentPage(details, consent.handle), { headers: consent.headers });
+  const { handle, cookie } = await beginTransaction(settings, 'consent', authRequest, {});
+  return new Response(consentPage(details, handle), {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Set-Cookie': cookie,
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': "frame-ancestors 'none'",
+      'X-Frame-Options': 'DENY',
+    },
+  });
 }
 
-async function submitConsent(request: Request, env: Env, settings: Settings): Promise<Response> {
-  const oauth = env.OAUTH_PROVIDER;
+async function submitConsent(request: Request, settings: Settings): Promise<Response> {
   const form = await request.formData();
-  const handle = String(form.get('handle'));
+  const consent = await finishTransaction<object>(
+    settings,
+    'consent',
+    request,
+    String(form.get('handle')),
+  );
+  const headers = new Headers({ 'Cache-Control': 'no-store' });
+  headers.append('Set-Cookie', consent.clearCookie);
 
   if (form.get('decision') !== 'approve') {
-    const denied = await oauth.denyConsent(request, handle);
-    return new Response(null, { status: 302, headers: denied.headers });
+    return redirect(authorizationErrorRedirect(consent.request, 'access_denied'), headers);
   }
 
-  const approved = await oauth.approveConsent(request, handle, { scope: [SCOPE_ACCESS] });
   const codeVerifier = base64Url(crypto.getRandomValues(new Uint8Array(32)));
-  const { state, headers } = await oauth.beginUpstream(approved.request, {
-    data: { codeVerifier } satisfies UpstreamData,
-    headers: approved.headers,
-  });
-  return redirect(buildAuthorizeUrl(settings, state, await s256(codeVerifier)), headers);
+  const { handle, cookie } = await beginTransaction<UpstreamData>(
+    settings,
+    'upstream',
+    { ...consent.request, scope: [SCOPE_ACCESS] },
+    { codeVerifier },
+  );
+  headers.append('Set-Cookie', cookie);
+  return redirect(buildAuthorizeUrl(settings, handle, await s256(codeVerifier)), headers);
 }
 
 async function handleCallback(request: Request, env: Env, settings: Settings): Promise<Response> {
   const oauth = env.OAUTH_PROVIDER;
-  const { request: authRequest, data, headers } = await oauth.finishUpstream<UpstreamData>(request);
   const params = new URL(request.url).searchParams;
+  const upstream = await finishTransaction<UpstreamData>(
+    settings,
+    'upstream',
+    request,
+    params.get('state') ?? '',
+  );
+  const { request: authRequest, data } = upstream;
+  const headers = new Headers({ 'Cache-Control': 'no-store' });
+  headers.append('Set-Cookie', upstream.clearCookie);
 
   if (params.has('error')) {
     return redirect(authorizationErrorRedirect(authRequest, 'access_denied'), headers);
@@ -128,7 +145,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   // Checked before the consent page, so setup problems appear before anyone is sent to YNAB.
   const settings = readSettings(env);
   if (pathname === CALLBACK_PATH) return handleCallback(request, env, settings);
-  return method === 'GET' ? showConsent(request, env) : submitConsent(request, env, settings);
+  return method === 'GET' ? showConsent(request, env, settings) : submitConsent(request, settings);
 }
 
 /** Pages and sign-in. The OAuth library sends every other path here, except its own endpoints. */
