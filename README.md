@@ -23,6 +23,17 @@ It runs on the Cloudflare Workers Free plan at `https://ynab-mcp.tcgarvin.com/mc
 - **Sign-in:** the Worker is its own OAuth server for MCP clients, and sends users to YNAB to sign
   in. Clients only ever hold tokens issued by this server. YNAB tokens stay encrypted in Workers KV.
 - **Access:** only YNAB user ids in `ALLOWED_YNAB_USER_IDS` can sign in or make requests.
+- **Clients:** only Claude's and ChatGPT's apps, including Claude Code and Codex, can connect. They
+  identify themselves with client metadata documents
+  ([Claude](https://claude.com/docs/connectors/building/authentication),
+  [ChatGPT](https://developers.openai.com/apps-sdk/build/auth),
+  [Codex](https://learn.chatgpt.com/docs/extend/mcp)) and connect as public clients using PKCE.
+  Sign-in codes only ever go to those apps' callback URLs or to the user's own computer, so a phishing
+  link can't deliver one to a site an attacker runs. An attacker with their own Claude or ChatGPT
+  account could still send a link to a sign-in they started there, so only approve sign-ins you just
+  started yourself. To use another MCP client, add it to `src/auth/client-policy.ts`.
+- **KV writes:** sign-in state stays in encrypted cookies until YNAB has identified an allowed user,
+  so anonymous visitors can't spend the daily KV write limit that token refresh depends on.
 - **Setup errors:** if a required secret isn't set, sign-in and MCP requests return a 503 naming the
   missing settings, without their values.
 - **Writes:** YNAB's only write-capable OAuth access is full access, so the limit on what can change
@@ -33,7 +44,9 @@ It runs on the Cloudflare Workers Free plan at `https://ynab-mcp.tcgarvin.com/mc
 ## Cost
 
 The Free plan costs $0, and going over a limit makes requests fail rather than generating a bill.
-Limits are 100,000 requests per day, 10 ms of CPU per request, and 1,000 KV writes per day. To stay
+Limits are 100,000 requests per day, 10 ms of CPU per request, and 1,000 KV writes per day. Nothing
+stops anonymous traffic from using up the request limit, which would take the server down until the
+limit resets. To stay
 within the CPU limit, transaction searches return at most 500 results and cover at most 30 days,
 unless they have a payee, category, or type filter, which YNAB applies before the server parses
 anything. Any tool call fails if YNAB returns more than about 1 MB. The server is stateless, so it
